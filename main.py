@@ -3,155 +3,169 @@ import asyncio
 import yt_dlp
 import aiofiles
 import ffmpeg
+from PIL import Image
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo
+from dotenv import load_dotenv
 
-# Telegram API Credentials
-API_ID = "your_api_id"
-API_HASH = "your_api_hash"
-BOT_TOKEN = "your_bot_token"
+# Load environment variables
+load_dotenv()
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Initialize Telethon Client
+# Initialize Telegram Bot
 bot = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Download Directory
+# Constants
 DOWNLOAD_DIR = "downloads"
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB (Telegram Limit)
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Progress Bar
-async def progress_callback(current, total, message, status="Downloading"):
-    percent = (current / total) * 100
-    progress_bar = f"[{'█' * int(percent // 5)}{'-' * (20 - int(percent // 5))}]"
-    await message.edit(f"**{status}:** {percent:.1f}%\n{progress_bar}")
+# yt-dlp Default Options
+YDL_OPTIONS = {
+    "quiet": True,
+    "noprogress": True,
+    "format": "bv+ba/best",
+    "merge_output_format": "mp4",
+    "postprocessors": [{"key": "FFmpegPostProcessor"}],
+    "writesubtitles": True,
+    "subtitleslangs": ["en", "es", "fr"],
+    "retries": 3,
+    "fragment_retries": 5,
+    "socket_timeout": 10,
+}
 
-# Fetch available quality options
-async def get_quality_options(url):
-    options = {
-        "quiet": True,
-        "list_formats": True,
-    }
-    async with yt_dlp.YoutubeDL(options) as ydl:
-        info = await asyncio.to_thread(ydl.extract_info, url, download=False)
-        formats = info.get("formats", [])
-        return [(f"{fmt['format_id']} - {fmt['resolution']} - {fmt['ext']}", fmt["format_id"]) for fmt in formats if "resolution" in fmt]
+# Progress Bar
+async def progress_callback(d, message):
+    if d["status"] == "downloading":
+        downloaded = d.get("downloaded_bytes", 0)
+        total = d.get("total_bytes", 1)
+        percent = (downloaded / total) * 100
+        progress_bar = f"[{'█' * int(percent // 5)}{'-' * (20 - int(percent // 5))}]"
+        await message.edit(f"📥 **Downloading:** {percent:.1f}%\n{progress_bar}")
+
+# Extract Available Qualities
+async def get_available_qualities(url):
+    options = YDL_OPTIONS.copy()
+    options["list_formats"] = True
+    ydl = yt_dlp.YoutubeDL(options)
+    info = await asyncio.to_thread(ydl.extract_info, url, download=False)
+
+    formats = [
+        {"id": fmt["format_id"], "res": fmt["resolution"], "ext": fmt["ext"]}
+        for fmt in info.get("formats", [])
+        if "resolution" in fmt
+    ]
+
+    return formats
 
 # Download Video
-async def download_video(url, format_id=None, is_audio=False, message=None):
-    output_template = f"{DOWNLOAD_DIR}/%(title)s.{'mp3' if is_audio else 'mp4'}"
-    options = {
-        "outtmpl": output_template,
-        "format": format_id or ("bestaudio" if is_audio else "best"),
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "progress_hooks": [lambda d: asyncio.create_task(progress_callback(
-            d.get("downloaded_bytes", 0),
-            d.get("total_bytes", 1),
-            message,
-            "Downloading"
-        ))],
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}] if is_audio else []
-    }
+async def download_video(url, format_id=None, message=None):
+    options = YDL_OPTIONS.copy()
+    options["outtmpl"] = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
+    options["progress_hooks"] = [lambda d: asyncio.create_task(progress_callback(d, message))]
+    if format_id:
+        options["format"] = format_id
 
-    async with yt_dlp.YoutubeDL(options) as ydl:
-        info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-        return ydl.prepare_filename(info), info.get("title", "video")
+    ydl = yt_dlp.YoutubeDL(options)
+    info = await asyncio.to_thread(ydl.extract_info, url, download=True)
 
-# Upload to Telegram
-async def upload_video(file_path, title, event):
+    title = info.get("title", "video")
+    caption = info.get("description", "")
+    thumbnail_url = info.get("thumbnail", None)
+    subtitle_files = [sub["filepath"] for sub in info.get("requested_subtitles", {}).values() if "filepath" in sub]
+
+    file_path = ydl.prepare_filename(info)
+    thumb_path = f"{DOWNLOAD_DIR}/{title}.jpg" if thumbnail_url else None
+
+    if thumbnail_url:
+        await extract_thumbnail(thumbnail_url, thumb_path)
+
+    return file_path, title, caption, thumb_path, subtitle_files
+
+# Extract Thumbnail
+async def extract_thumbnail(thumbnail_url, save_path):
+    try:
+        async with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            await asyncio.to_thread(ydl.download, [thumbnail_url])
+        img = Image.open(save_path)
+        img.thumbnail((320, 320))
+        img.save(save_path)
+        return save_path
+    except Exception:
+        return None
+
+# Upload Video
+async def upload_video(file_path, title, caption, thumb_path, subtitle_files, event):
     chat_id = event.chat_id
+    msg = await event.reply(f"📤 **Processing {title}...**")
+
     async with aiofiles.open(file_path, "rb") as f:
-        file_size = os.path.getsize(file_path)
-        msg = await event.reply(f"**Uploading {title}...**")
-
-        async def upload_progress(sent_bytes, total_bytes):
-            await progress_callback(sent_bytes, total_bytes, msg, "Uploading")
-
         await bot.send_file(
             chat_id,
             file=f,
-            caption=f"🎥 **{title}**",
-            progress_callback=upload_progress,
-            attributes=[DocumentAttributeVideo(duration=0, w=1920, h=1080)]
+            caption=f"🎥 **{title}**\n\n{caption[:1024]}",
+            attributes=[DocumentAttributeVideo(duration=0, w=1920, h=1080)],
+            thumb=thumb_path,
         )
 
-    await msg.delete()
-    os.remove(file_path)  # Clean up
+    os.remove(file_path)
+    if thumb_path:
+        os.remove(thumb_path)
+    
+    for sub_file in subtitle_files:
+        await bot.send_file(chat_id, file=sub_file, caption=f"📜 Subtitles for **{title}**")
+        os.remove(sub_file)
 
-# Handle /start Command
+    await msg.delete()
+
+# Handle /start
 @bot.on(events.NewMessage(pattern="/start"))
 async def start(event):
-    await event.reply(
-        "👋 **Welcome!**\nSend me a video URL to download.\n\n"
-        "✅ Supports YouTube, TikTok, Instagram, Facebook, Twitter, etc.\n"
-        "🎵 Use `/audio <URL>` to download as MP3."
-    )
+    await event.reply("👋 **Welcome!**\nSend me a video URL.")
 
-# Handle Audio Downloads
-@bot.on(events.NewMessage(pattern=r"/audio (.+)"))
-async def audio_download(event):
-    url = event.pattern_match.group(1)
-    msg = await event.reply("🎶 **Downloading audio...**")
+# Handle Video URL
+@bot.on(events.NewMessage)
+async def process_url(event):
+    url = event.text.strip()
+    if not url.startswith(("http://", "https://")):
+        return
+
+    msg = await event.reply("🔍 **Fetching available video qualities...**")
     
     try:
-        file_path, title = await download_video(url, is_audio=True, message=msg)
-        await upload_video(file_path, title, event)
-    except Exception as e:
-        await event.reply(f"❌ **Error:** {str(e)}")
-    
-    finally:
-        await msg.delete()
-
-# Handle Video Download Requests with Quality Selection
-@bot.on(events.NewMessage(pattern=r"/video (.+)"))
-async def choose_quality(event):
-    url = event.pattern_match.group(1)
-    msg = await event.reply("🔍 **Fetching available qualities...**")
-
-    try:
-        formats = await get_quality_options(url)
-        buttons = [Button.inline(text, data=f"{url}|{fid}") for text, fid in formats[:10]]
+        formats = await get_available_qualities(url)
+        
+        # If only one format available, download directly
+        if len(formats) <= 1:
+            await msg.edit("📥 **Downloading best available quality...**")
+            file_path, title, caption, thumb_path, subtitle_files = await download_video(url, message=msg)
+            await upload_video(file_path, title, caption, thumb_path, subtitle_files, event)
+            return
+        
+        # Show quality selection buttons
+        buttons = [
+            Button.inline(f"{fmt['res']} - {fmt['ext']}", data=f"{url}|{fmt['id']}") for fmt in formats[:10]
+        ]
+        buttons.append(Button.inline("⏩ Skip (Best Quality)", data=f"{url}|best"))
+        
         await msg.edit("🎥 **Select video quality:**", buttons=buttons)
+    
     except Exception as e:
-        await msg.edit(f"❌ **Error fetching formats:** {str(e)}")
+        await msg.edit(f"❌ **Error:** {str(e)}")
 
-# Handle Video Download with Selected Quality
+# Handle Quality Selection Callback
 @bot.on(events.CallbackQuery)
 async def quality_selected(event):
-    data = event.data.decode()
-    url, format_id = data.split("|")
-    
+    url, format_id = event.data.decode().split("|")
     msg = await event.edit("📥 **Downloading selected quality...**")
+
     try:
-        file_path, title = await download_video(url, format_id=format_id, message=msg)
-        await upload_video(file_path, title, event)
+        file_path, title, caption, thumb_path, subtitle_files = await download_video(url, format_id=format_id, message=msg)
+        await upload_video(file_path, title, caption, thumb_path, subtitle_files, event)
     except Exception as e:
         await event.edit(f"❌ **Error:** {str(e)}")
-    finally:
-        await msg.delete()
-
-# Handle Playlist Downloads
-@bot.on(events.NewMessage(pattern=r"/playlist (.+)"))
-async def playlist_download(event):
-    url = event.pattern_match.group(1)
-    msg = await event.reply("📂 **Downloading playlist...**")
-
-    try:
-        options = {
-            "outtmpl": f"{DOWNLOAD_DIR}/%(title)s.%(ext)s",
-            "format": "best",
-            "merge_output_format": "mp4",
-            "quiet": True,
-        }
-        async with yt_dlp.YoutubeDL(options) as ydl:
-            info = await asyncio.to_thread(ydl.extract_info, url, download=True)
-        
-        for entry in info["entries"]:
-            file_path = f"{DOWNLOAD_DIR}/{entry['title']}.mp4"
-            await upload_video(file_path, entry["title"], event)
-
-    except Exception as e:
-        await event.reply(f"❌ **Error:** {str(e)}")
-
     finally:
         await msg.delete()
 
