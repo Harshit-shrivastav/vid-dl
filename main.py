@@ -28,7 +28,7 @@ YDL_OPTIONS = {
     "noprogress": True,
     "format": "bv+ba/best",
     "merge_output_format": "mp4",
-    "postprocessors": [{"key": "FFmpegPostProcessor"}],
+    "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
     "writesubtitles": True,
     "subtitleslangs": ["en", "es", "fr"],
     "retries": 3,
