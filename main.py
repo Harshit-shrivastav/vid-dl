@@ -2,7 +2,6 @@ import os
 import asyncio
 import yt_dlp
 import aiofiles
-import ffmpeg
 from PIL import Image
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo
@@ -17,25 +16,28 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Initialize Telegram Bot
 bot = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# Constants
+# Directory Setup
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# yt-dlp Default Options
+# yt-dlp Options (Fixes YouTube & Instagram Issues)
 YDL_OPTIONS = {
     "quiet": True,
     "noprogress": True,
-    "format": "bv+ba/best",
+    "format": "bv*+ba/best",  # Ensures correct video & audio merging
     "merge_output_format": "mp4",
-    "postprocessors": [{"key": "FFmpegVideoConvertor"}],
+    "postprocessors": [
+        {"key": "FFmpegVideoConvertor", "preferedformat": "mp4"},
+        {"key": "FFmpegEmbedSubtitle"},
+        {"key": "FFmpegFixupStretched"},
+    ],
     "writesubtitles": True,
-    "subtitleslangs": ["en", "es", "fr"],
+    "subtitleslangs": ["en", "es"],
     "retries": 3,
-    "fragment_retries": 5,
     "socket_timeout": 10,
 }
 
-# Extract Available Qualities
+# Extract Available Video Qualities
 async def get_available_qualities(url):
     options = YDL_OPTIONS.copy()
     options["list_formats"] = True
@@ -43,7 +45,7 @@ async def get_available_qualities(url):
     info = await asyncio.to_thread(ydl.extract_info, url, download=False)
 
     formats = [
-        {"id": fmt["format_id"], "res": fmt["resolution"], "ext": fmt["ext"]}
+        {"id": fmt["format_id"], "res": fmt.get("resolution", "Unknown"), "ext": fmt["ext"]}
         for fmt in info.get("formats", [])
         if "resolution" in fmt
     ]
@@ -54,6 +56,7 @@ async def get_available_qualities(url):
 async def download_video(url, format_id=None):
     options = YDL_OPTIONS.copy()
     options["outtmpl"] = f"{DOWNLOAD_DIR}/%(title)s.%(ext)s"
+    options["recode_video"] = "mp4"  # Ensures correct format
     if format_id:
         options["format"] = format_id
 
@@ -146,7 +149,10 @@ async def quality_selected(event):
     url, format_id = event.data.decode().split("|")
     msg = await event.edit("📥 **Downloading selected quality...**")
 
-    file_path, title, caption, thumb_path = await download_video(url, format_id=format_id)
-    await upload_video(file_path, title, caption, thumb_path, event)
+    try:
+        file_path, title, caption, thumb_path = await download_video(url, format_id=format_id)
+        await upload_video(file_path, title, caption, thumb_path, event)
+    except Exception as e:
+        await msg.edit(f"❌ **Download Error:** {str(e)}")
 
 bot.run_until_disconnected()
